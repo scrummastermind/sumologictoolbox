@@ -1,6 +1,10 @@
 
 from qtpy import QtWidgets, QtGui, QtCore
 import pathlib
+import time
+import traceback
+import sys
+
 
 class ShowTextDialog(QtWidgets.QDialog):
 
@@ -26,8 +30,6 @@ class ShowTextDialog(QtWidgets.QDialog):
             self.searchbox.text()
         ))
 
-
-
     def setupUi(self, Dialog):
         Dialog.setObjectName("JSONDisplay")
         self.setWindowTitle(self.title)
@@ -51,7 +53,6 @@ class ShowTextDialog(QtWidgets.QDialog):
         self.layout.addWidget(self.textedit)
         self.setLayout(self.layout)
 
-
     def search(self, search_text):
         self.textedit.textCursor().clearSelection()
         if self.last_search == 'Up':
@@ -67,6 +68,59 @@ class ShowTextDialog(QtWidgets.QDialog):
 
     def search_up(self, search_text):
         search_result = self.textedit.find(search_text, QtGui.QTextDocument.FindBackward)
+
+
+class WorkerSignals(QtCore.QObject):
+
+    finished = QtCore.Signal()
+    error = QtCore.Signal(tuple)
+    result = QtCore.Signal(object)
+    progress = QtCore.Signal(int)
+
+
+class Worker(QtCore.QRunnable):
+    '''
+    Worker thread
+
+    Inherits from QRunnable to handler worker thread setup, signals and wrap-up.
+
+    :param callback: The function callback to run on this worker thread. Supplied args and
+                     kwargs will be passed through to the runner.
+    :type callback: function
+    :param args: Arguments to pass to the callback function
+    :param kwargs: Keywords to pass to the callback function
+
+    '''
+
+    def __init__(self, fn, *args, **kwargs):
+        super(Worker, self).__init__()
+
+        # Store constructor arguments (re-used for processing)
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+        # Add the callback to our kwargs
+        self.kwargs['progress_callback'] = self.signals.progress
+
+    @QtCore.Slot()
+    def run(self):
+        '''
+        Initialise the runner function with passed args, kwargs.
+        '''
+
+        # Retrieve args/kwargs here; and fire processing using them
+        try:
+            result = self.fn(*self.args, **self.kwargs)
+        except:
+            traceback.print_exc()
+            exctype, value = sys.exc_info()[:2]
+            self.signals.error.emit((exctype, value, traceback.format_exc()))
+        else:
+            self.signals.result.emit(result)  # Return the result of the processing
+        finally:
+            self.signals.finished.emit()  # Done
 
 
 # functions that are shared by multiple tabs. These are mostly import/export functions that will be used by their own tab
@@ -94,6 +148,7 @@ def find_keys(obj, key):
     results = extract(obj, arr, key)
     return results
 
+
 # Recursively find all instances of a key in a dict/list object and replace the value with a new value IF it
 # matches the old value
 def find_replace_specific_key_and_value(obj, key, old_value, new_value):
@@ -108,6 +163,7 @@ def find_replace_specific_key_and_value(obj, key, old_value, new_value):
             obj[index] = find_replace_specific_key_and_value(item, key, old_value, new_value)
     return obj
 
+
 def find_replace_keys(obj, key, new_value):
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -120,6 +176,7 @@ def find_replace_keys(obj, key, new_value):
         for index, item in enumerate(obj):
             obj[index] = find_replace_keys(item, key, new_value)
     return obj
+
 
 # This call gets the monitor(s) and then all connections used by that monitor. This is useful for exporting or copying a monitor
 # to a new org. This is a bit messy due to the requirement to specify connectionType in the get_connection method.
@@ -143,6 +200,7 @@ def export_monitor_and_connections(item_id, sumo):
                 monitor['connections'].append(exported_connection)
                 break
     return monitor
+
 
 def import_monitors_with_connections(parent_id, monitor, sumo):
 
@@ -169,9 +227,11 @@ def import_monitors_with_connections(parent_id, monitor, sumo):
         monitor = find_replace_specific_key_and_value(monitor, 'connectionId', connection_lookup['old_id'], connection_lookup['new_id'])
     result = sumo.import_monitor(parent_id, monitor)
 
+
 def import_monitors_without_connections(parent_id, monitor, sumo):
     monitor = find_replace_keys(monitor, 'notifications', [])
     result = sumo.import_monitor(parent_id, monitor)
+
 
 def import_saml_config(saml_export, sumo):
     # Hacky stuff to get create to work
@@ -181,6 +241,68 @@ def import_saml_config(saml_export, sumo):
     # End Hacky stuff
     status = sumo.create_saml_config(saml_export)
 
+
+def content_item_to_path(sumo, content, adminmode=False):
+    paths = []
+    if isinstance(content, dict):
+        if 'id' in content and 'name' in content and 'itemType' in content:
+            id = content['id']
+            name = content['name']
+            itemType = content['itemType']
+            currentPath = sumo.get_item_path(id, adminmode=adminmode)['path']
+            details = {'id': id, 'name': name, 'itemType': itemType, 'path': currentPath}
+            paths.append(details)
+
+            if itemType == 'Folder' and 'children' in content and len(content['children']) > 0:
+                for child in content['children']:
+                    if child['itemType'] == 'Folder':
+                        child = sumo.get_folder(child['id'], adminmode=adminmode)
+                    paths = paths + content_item_to_path(sumo, child, adminmode=adminmode)
+
+    elif isinstance(content, list):
+        for index, item in enumerate(content):
+            paths = paths + content_item_to_path(sumo,item, adminmode=adminmode)
+
+    return paths
+
+
+def export_user_and_roles(user_id, sumo):
+    user = sumo.get_user(str(user_id))
+    user['roles'] = []
+    for role_id in user['roleIds']:
+        role = sumo.get_role(str(role_id))
+        user['roles'].append(role)
+    return user
+
+def import_user_and_roles(user, sumo):
+    dest_roles = sumo.get_roles_sync()
+    for source_role in user['roles']:
+        role_already_exists_in_dest = False
+        source_role_id = source_role['id']
+        for dest_role in dest_roles:
+            if dest_role['name'] == source_role['name']:
+                role_already_exists_in_dest = True
+                dest_role_id = dest_role['id']
+        if role_already_exists_in_dest:
+            # print('found role at target: ' + source_role['name'])
+            user['roleIds'].append(dest_role_id)
+            user['roleIds'].remove(source_role_id)
+        else:
+            source_role['users'] = []
+            sumo.create_role(source_role)
+            updated_dest_roles = sumo.get_roles_sync()
+            for updated_dest_role in updated_dest_roles:
+                if updated_dest_role['name'] == source_role['name']:
+                    user['roleIds'].append(updated_dest_role['id'])
+            user['roleIds'].remove(source_role_id)
+            # print('Did not find role at target. Added role:' + source_role['name'])
+        # print('modified user: ' + str(user))
+    sumo.create_user(user['firstName'], user['lastName'], user['email'], user['roleIds'])
+
+
+def export_content(item_id, item_details, sumo, adminmode, export_connections=True, export_permissions=True):
+
+    content = sumo.export_content_job_sync(item_id, adminmode=adminmode)
 
 
 

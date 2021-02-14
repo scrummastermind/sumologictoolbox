@@ -6,9 +6,11 @@ import sys
 import re
 import pathlib
 import json
+import copy
 from logzero import logger
 from modules.sumologic import SumoLogic
-from modules.shared import ShowTextDialog
+from modules.shared import ShowTextDialog, find_replace_specific_key_and_value, content_item_to_path
+
 
 class findReplaceCopyDialog(QtWidgets.QDialog):
 
@@ -461,11 +463,6 @@ class content_tab(QtWidgets.QWidget):
             exported_json['children'] = children
             return exported_json
 
-
-
-
-
-
     # Start methods for Content Tab
 
     def findreplacecopycontent(self, ContentListWidgetFrom, ContentListWidgetTo, fromurl, fromid, fromkey, tourl,
@@ -586,15 +583,37 @@ class content_tab(QtWidgets.QWidget):
         try:
             selecteditems = ContentListWidgetFrom.selectedItems()
             if len(selecteditems) > 0:  # make sure something was selected
-                fromsumo = SumoLogic(fromid, fromkey, endpoint=fromurl, log_level=self.mainwindow.log_level)
-                tosumo = SumoLogic(toid, tokey, endpoint=tourl, log_level=self.mainwindow.log_level)
-                currentdir = ContentListWidgetTo.currentdirlist[-1]
-                tofolderid = ContentListWidgetTo.currentcontent['id']
+                from_sumo = SumoLogic(fromid, fromkey, endpoint=fromurl, log_level=self.mainwindow.log_level)
+                to_sumo = SumoLogic(toid, tokey, endpoint=tourl, log_level=self.mainwindow.log_level)
+                current_source_dir = ContentListWidgetFrom.currentdirlist[-1]
+                from_folder_id = ContentListWidgetFrom.currentcontent['id']
+
+                current_dest_dir = ContentListWidgetTo.currentdirlist[-1]
+                to_folder_id = ContentListWidgetTo.currentcontent['id']
+                
+                fromPaths = []
+
                 for selecteditem in selecteditems:
-                        item_id = selecteditem.details['id']
-                        content = fromsumo.export_content_job_sync(item_id, adminmode=fromadminmode)
-                        status = tosumo.import_content_job_sync(tofolderid, content, adminmode=toadminmode)
-                self.updatecontentlist(ContentListWidgetTo, tourl, toid, tokey, toradioselected, todirectorylabel)
+                    item_id = selecteditem.details['id']
+                    item_type = selecteditem.details['itemType']
+
+                    if item_type == 'Folder':
+                        from_content_item = from_sumo.get_folder(item_id, adminmode=fromadminmode)
+                    else:
+                        from_content_item = selecteditem.details
+
+                    fromPaths.append(content_item_to_path(from_sumo, from_content_item, adminmode=fromadminmode))
+                    print(fromPaths)
+
+                    content = from_sumo.export_content_job_sync(item_id, adminmode=fromadminmode)
+                    content = self.update_content_webhookid(from_sumo, to_sumo, content)
+                    status = to_sumo.import_content_job_sync(to_folder_id, content, adminmode=toadminmode)
+
+                toFolder = to_sumo.get_folder(to_folder_id, adminmode=toadminmode)
+                toPaths = content_item_to_path(to_sumo, toFolder, adminmode=toadminmode)
+                print(toPaths)
+                #self.sync_copied_contents_permissions(from_sumo, to_sumo, from_folder_id, to_folder_id, fromPaths, toPaths, fromAdminMode=fromadminmode, toAdminMode=toadminmode)
+                #self.updatecontentlist(ContentListWidgetTo, tourl, toid, tokey, toradioselected, todirectorylabel)
                 return
 
             else:
@@ -605,6 +624,111 @@ class content_tab(QtWidgets.QWidget):
             logger.exception(e)
             self.mainwindow.errorbox('Something went wrong:\n\n' + str(e))
         return
+
+    def get_source_to_dest_meta_ids(self, fromsumo, tosumo):
+        logger.info('[Content] Getting Source To Destination Meta IDs')
+        source_to_dest_ids = {}
+
+        fromUsers = fromsumo.get_users_sync()
+        toUsers = tosumo.get_users_sync()
+        fromRoles = fromsumo.get_roles_sync()
+        toRoles = tosumo.get_roles_sync()
+        source_org_id = fromsumo.get_org_id()
+        dest_org_id = tosumo.get_org_id()
+        source_user_id_to_email = {user['id']: user['email'] for user in fromUsers}
+        des_user_email_to_id = {user['email']: user['id'] for user in toUsers}
+
+        source_user_id_to_dest_user_id = {}
+        for userId, email in source_user_id_to_email.items():
+            if email in des_user_email_to_id.keys():
+                source_user_id_to_dest_user_id[userId] = des_user_email_to_id[email]
+            else:
+                #destUserId = CopyUsersAndAssignedRoles(userId, fromsumo, tosumo)['id']
+                #source_user_id_to_dest_user_id[userId] = destUserId
+                logger.info("Failed to find user with e-mail: {} on the destination and it was copied over along with any assigned roles".format(email))
+
+        source_role_id_to_name = {role['id']:role['name'] for role in fromRoles}
+        des_role_name_to_id = {role['name']:role['id'] for role in toRoles}
+
+        source_role_id_to_dest_role_id = {}
+        for roleId, roleName in source_role_id_to_name.items():
+            if roleName in des_role_name_to_id.keys():
+                source_role_id_to_dest_role_id[roleId] = des_role_name_to_id[roleName]
+            else:
+                missingRole = fromsumo.get_role(roleId)
+                destUsersAssignedTorle = [source_user_id_to_dest_user_id[sourceUserId] for sourceUserId in missingRole['users'] if sourceUserId in source_user_id_to_dest_user_id.keys()]
+                missingRole['users'] = destUsersAssignedTorle
+                tosumo.create_role(missingRole)
+                logger.info("Failed to find role with name: {} on the destination and it was copied over and assigned existing destination users to it".format(roleName))
+        
+        source_to_dest_ids = {'org': {source_org_id:dest_org_id}, 'user': source_user_id_to_dest_user_id, 'role': source_role_id_to_dest_role_id}
+        return source_to_dest_ids
+
+    def sync_copied_contents_permissions(self, fromsumo, tosumo, fromFolderId, toFolderId, fromPaths, toPaths, fromAdminMode=False, toAdminMode=False):
+        logger.info('Syncing Copied Contents Permissions')
+
+        fromBasePath = fromsumo.get_item_path(fromFolderId, adminmode=fromAdminMode)['path']
+        toBasePath = tosumo.get_item_path(toFolderId, adminmode=toAdminMode)['path']
+        source_to_dest_ids = self.get_source_to_dest_meta_ids(fromsumo, tosumo)
+
+        source_ids_to_paths = {}
+        for fromPerm in fromPaths:
+            fromId= fromPerm['id']
+            fromPath = fromPerm['path'] if fromPerm['path'] != '' else fromPerm['name']
+            fromPath = str(fromPath).replace(fromBasePath, '')
+            source_ids_to_paths[fromId] = fromPath
+
+        dest_paths_to_ids = {}
+        for destPerm in toPaths:
+            toPath = destPerm['path'] if destPerm['path'] else destPerm['name']
+            toPath = str(toPath).replace(toBasePath, '')
+            dest_paths_to_ids[toPath] = destPerm['id']
+
+        destPermissions = {}
+        requestResults = {}
+        for sourceContentId, sourceContentPath in source_ids_to_paths.items():
+            if sourceContentPath in dest_paths_to_ids.keys():
+                destContentId = dest_paths_to_ids[sourceContentPath]
+                sourcePermissions = fromsumo.get_permissions(sourceContentId, explicit_only=True,adminmode=fromAdminMode)['explicitPermissions']
+
+                currentDestPermissions = []
+                for permission in sourcePermissions:
+                    currentDestPermission = copy.deepcopy(permission)
+                    currentSourceType = permission['sourceType']
+                    currentSourceId = permission['sourceId']
+                    currentDestPermission['sourceId'] = source_to_dest_ids[currentSourceType][currentSourceId]
+                    currentDestPermission['contentId'] = destContentId
+                    currentDestPermissions.append(currentDestPermission)
+
+                permissionsBody = {'contentPermissionAssignments':[], 'notifyRecipients':False, 'notificationMessage':''}
+                permissionsBody['contentPermissionAssignments'] = currentDestPermissions
+                requestResult = tosumo.add_permissions(destContentId, permissionsBody, adminmode=toAdminMode)
+                requestResults[sourceContentPath] = requestResult
+            else:
+                logger.warn("Failed to import content {} from {} to {}, Source content id:{}".format(sourceContentPath,fromBasePath, toBasePath, sourceContentId))
+        
+        return requestResults
+
+    def update_content_webhookid(self, fromsumo, tosumo, content):
+        source_connections = fromsumo.get_connections_sync()
+        dest_connections = tosumo.get_connections_sync()
+
+        source_connections_dict = {connection['id']: connection['name'] for connection in source_connections}
+        print(source_connections)
+        dest_connections_dict = {connection['name']: connection['id'] for connection in dest_connections}
+        source_to_dest_dict = {id: dest_connections_dict[name] for id, name in source_connections_dict.items() if name in dest_connections_dict}
+
+        for source_connection_id in source_connections_dict.keys():
+            if source_connection_id not in source_to_dest_dict:
+                source_connection = fromsumo.get_connection(source_connection_id, 'WebhookConnection')
+                source_connection['type'] = str(source_connection['type']).replace('Connection', 'Definition')
+                dest_connection = tosumo.create_connection(source_connection)
+                dest_webhookId = dest_connection['id']
+                source_to_dest_dict[source_connection_id] = dest_webhookId
+        
+        for source_connection_id, dest_connection_id in source_to_dest_dict.items():
+            content = find_replace_specific_key_and_value(content,'webhookId',source_connection_id, dest_connection_id)
+        return content        
 
     def create_folder(self, ContentListWidget, url, id, key, radioselected, directorylabel):
         if ContentListWidget.updated == True:
